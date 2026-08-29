@@ -209,6 +209,9 @@ tempCodeRunnerFile.py
 # PyPI configuration file
 .pypirc
 
+# microTrain runtime artifacts
+runs/
+
 # Marimo
 marimo/_static/
 marimo/_lsp/

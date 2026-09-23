@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import shutil
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -13,8 +14,34 @@ from .model import ModelConfig, SmolLM
 from .tokenizer import MicroTokenizer
 
 
-BASE_MODEL_ID = "HuggingFaceTB/SmolLM2-135M"
-BASE_REVISION = "93efa2f097d58c2a74874c7e644dbc9b0cee75a2"
+
+@dataclass(frozen=True)
+class ModelPreset:
+    name: str
+    display_name: str
+    model_id: str
+    revision: str
+
+
+DEFAULT_MODEL = "135m"
+MODEL_PRESETS = {
+    "135m": ModelPreset(
+        name="135m",
+        display_name="SmolLM2-135M",
+        model_id="HuggingFaceTB/SmolLM2-135M",
+        revision="93efa2f097d58c2a74874c7e644dbc9b0cee75a2",
+    ),
+    "360m": ModelPreset(
+        name="360m",
+        display_name="SmolLM2-360M",
+        model_id="HuggingFaceTB/SmolLM2-360M",
+        revision="f8027fd0eaeea54caa13c31d31b9fdc459c38b49",
+    ),
+}
+
+# Backward-compatible names for callers that use the default preset directly.
+BASE_MODEL_ID = MODEL_PRESETS[DEFAULT_MODEL].model_id
+BASE_REVISION = MODEL_PRESETS[DEFAULT_MODEL].revision
 TOKENIZER_FILES = (
     "tokenizer.json",
     "tokenizer_config.json",
@@ -22,7 +49,12 @@ TOKENIZER_FILES = (
 )
 
 
-def download_base(destination: str | Path, revision: str = BASE_REVISION) -> Path:
+def download_base(
+    destination: str | Path,
+    revision: str = BASE_REVISION,
+    *,
+    model_id: str = BASE_MODEL_ID,
+) -> Path:
     try:
         from huggingface_hub import snapshot_download
     except ImportError as exc:
@@ -31,7 +63,7 @@ def download_base(destination: str | Path, revision: str = BASE_REVISION) -> Pat
     destination = Path(destination)
     destination.mkdir(parents=True, exist_ok=True)
     snapshot_download(
-        repo_id=BASE_MODEL_ID,
+        repo_id=model_id,
         revision=revision,
         local_dir=destination,
         allow_patterns=["config.json", "*.safetensors", *TOKENIZER_FILES],
@@ -39,7 +71,7 @@ def download_base(destination: str | Path, revision: str = BASE_REVISION) -> Pat
     required = ["config.json", "model.safetensors", "tokenizer.json", "tokenizer_config.json"]
     missing = [filename for filename in required if not (destination / filename).is_file()]
     if missing:
-        raise RuntimeError(f"incomplete {BASE_MODEL_ID} download: missing {missing}")
+        raise RuntimeError(f"incomplete {model_id} download: missing {missing}")
     return destination
 
 

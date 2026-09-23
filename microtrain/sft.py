@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import random
 from dataclasses import dataclass
-from typing import Sequence
+from typing import Callable, Sequence
 
 import torch
 import torch.nn.functional as F
@@ -47,6 +47,8 @@ def train_sft(
     examples: Sequence[dict[str, str]],
     config: SFTConfig,
     device: str | torch.device,
+    *,
+    on_log: Callable[[dict[str, float | int]], None] | None = None,
 ) -> list[dict[str, float | int]]:
     if not examples:
         raise ValueError("SFT requires at least one example")
@@ -69,8 +71,13 @@ def train_sft(
         loss.backward()
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
         optimizer.step()
+        record = {
+            "step": step,
+            "loss": float(loss.detach()),
+            "grad_norm": float(grad_norm),
+        }
+        metrics.append(record)
         if step == 1 or step % config.log_every == 0 or step == config.steps:
-            metrics.append(
-                {"step": step, "loss": float(loss.detach()), "grad_norm": float(grad_norm)}
-            )
+            if on_log is not None:
+                on_log(record)
     return metrics

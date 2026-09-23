@@ -10,6 +10,7 @@ import torch
 from microtrain.checkpoint import (
     BASE_MODEL_ID,
     BASE_REVISION,
+    MODEL_PRESETS,
     canonical_state_dict,
     download_base,
     load_model,
@@ -70,6 +71,32 @@ def test_download_base_fetches_the_pinned_public_checkpoint(tmp_path: Path, monk
     assert destination == tmp_path / "base"
     assert captured["repo_id"] == BASE_MODEL_ID
     assert captured["revision"] == BASE_REVISION
+
+
+def test_download_base_accepts_the_larger_preset(tmp_path: Path, monkeypatch) -> None:
+    hub = pytest.importorskip("huggingface_hub")
+    captured = {}
+
+    def fake_snapshot_download(**kwargs):
+        captured.update(kwargs)
+        destination = Path(kwargs["local_dir"])
+        for filename in (
+            "config.json",
+            "model.safetensors",
+            "tokenizer.json",
+            "tokenizer_config.json",
+        ):
+            (destination / filename).write_text("test")
+
+    monkeypatch.setattr(hub, "snapshot_download", fake_snapshot_download)
+    preset = MODEL_PRESETS["360m"]
+    download_base(
+        tmp_path / "base",
+        revision=preset.revision,
+        model_id=preset.model_id,
+    )
+    assert captured["repo_id"] == "HuggingFaceTB/SmolLM2-360M"
+    assert captured["revision"] == "f8027fd0eaeea54caa13c31d31b9fdc459c38b49"
 
 
 @pytest.mark.skipif(

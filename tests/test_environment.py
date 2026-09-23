@@ -64,6 +64,16 @@ def test_environment_executes_one_tool_call_then_accepts_answer() -> None:
     result = env.step(direct_answer(task.answer))
     assert result.valid and result.done and result.correct
     assert env.tool_calls == 1
+    assert env.tool_attempts == 1
+
+
+def test_environment_distinguishes_attempted_and_executed_tool_calls() -> None:
+    task = Task("x", "37 * 48 + 19", 1795, "hard", "test")
+    env = ArithmeticEnv(task)
+    result = env.step(" <tool>-216</tool>")
+    assert result.done and not result.valid
+    assert env.tool_attempts == 1
+    assert env.tool_calls == 0
 
 
 def test_episode_reward_makes_tool_use_a_real_choice() -> None:
@@ -89,7 +99,10 @@ def test_manifest_is_deterministic_and_structurally_held_out(tmp_path) -> None:
     assert len(first["rlvr"]) == sizes.rlvr
     assert {example["difficulty"] for example in first["rlvr"]} == {"easy"}
     assert len(first["agent_rl"]) == sizes.agent_rl
-    assert {example["difficulty"] for example in first["agent_rl"]} == {"easy", "medium"}
+    agent_difficulties = [example["difficulty"] for example in first["agent_rl"]]
+    assert set(agent_difficulties) == {"easy", "medium", "hard"}
+    counts = [agent_difficulties.count(difficulty) for difficulty in set(agent_difficulties)]
+    assert max(counts) - min(counts) <= 1
     path = tmp_path / "manifest.json"
     write_manifest(path, first)
     assert read_manifest(path) == first

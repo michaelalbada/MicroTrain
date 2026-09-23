@@ -20,6 +20,7 @@ class RewardBreakdown:
     correct: bool
     valid_format: bool
     used_tool: bool
+    attempted_tool: bool = False
     invalid_action: bool = False
     steps: int = 1
 
@@ -29,10 +30,17 @@ def single_turn_reward(task: Task, response: str) -> RewardBreakdown:
     valid = answer is not None
     correct = answer == task.answer if valid else False
     used_tool = parse_tool_call(response) is not None
+    attempted_tool = "<tool>" in response
     reward = (CORRECT_REWARD if correct else 0.0) + (
         VALID_FORMAT_BONUS if valid else -VALID_FORMAT_BONUS
     )
-    return RewardBreakdown(reward, correct, valid, used_tool)
+    return RewardBreakdown(
+        reward,
+        correct,
+        valid,
+        used_tool,
+        attempted_tool=attempted_tool,
+    )
 
 
 def episode_reward(
@@ -41,6 +49,7 @@ def episode_reward(
     valid: bool,
     tool_calls: int,
     steps: int,
+    tool_attempts: int | None = None,
 ) -> RewardBreakdown:
     invalid = not valid
     reward = (
@@ -49,4 +58,13 @@ def episode_reward(
         - TOOL_CALL_COST * tool_calls
         - EXTRA_STEP_COST * max(0, steps - 1)
     )
-    return RewardBreakdown(reward, correct, valid, tool_calls > 0, invalid, steps)
+    attempts = tool_calls if tool_attempts is None else tool_attempts
+    return RewardBreakdown(
+        reward,
+        correct,
+        valid,
+        tool_calls > 0,
+        attempted_tool=attempts > 0,
+        invalid_action=invalid,
+        steps=steps,
+    )

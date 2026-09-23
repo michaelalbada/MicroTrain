@@ -8,7 +8,7 @@ import random
 from dataclasses import dataclass
 from pathlib import Path
 from statistics import mean
-from typing import Sequence
+from typing import Callable, Sequence
 
 import torch
 
@@ -43,6 +43,50 @@ def _mean(values: Sequence[float | int]) -> float:
     return mean(values) if values else 0.0
 
 
+def aggregate_quality_index(
+    *,
+    direct_accuracy: float,
+    tool_accuracy: float,
+    valid_format_rate: float,
+    preference_accuracy: float,
+    unnecessary_tool_rate: float,
+) -> float:
+    """Combine complementary evaluation signals into one value in [0, 1].
+
+    A geometric mean makes a severe regression in one dimension visible instead
+    of allowing a strong preference score to hide it. The component metrics
+    remain the authoritative explanation of the result.
+    """
+
+    def bounded(value: float) -> float:
+        return max(0.0, min(1.0, value))
+
+    task_success = (
+        0.4 * bounded(direct_accuracy) + 0.6 * bounded(tool_accuracy)
+    )
+    components = (
+        (task_success, 0.55),
+        (bounded(valid_format_rate), 0.20),
+        (bounded(preference_accuracy), 0.15),
+        (1.0 - bounded(unnecessary_tool_rate), 0.10),
+    )
+    if any(value == 0.0 for value, _ in components):
+        return 0.0
+    return math.prod(value**weight for value, weight in components)
+
+
+def quality_index_from_metrics(metrics: dict[str, object]) -> float:
+    """Calculate the index for new or historical evaluation records."""
+
+    return aggregate_quality_index(
+        direct_accuracy=float(metrics.get("direct_accuracy", 0.0)),
+        tool_accuracy=float(metrics.get("tool_accuracy", 0.0)),
+        valid_format_rate=float(metrics.get("valid_format_rate", 0.0)),
+        preference_accuracy=float(metrics.get("preference_accuracy", 0.0)),
+        unnecessary_tool_rate=float(metrics.get("unnecessary_tool_rate", 0.0)),
+    )
+
+
 def bootstrap_interval(
     values: Sequence[bool], *, samples: int, seed: int, confidence: float = 0.95
 ) -> tuple[float, float]:
@@ -66,6 +110,7 @@ def heldout_preference_metrics(
     device: str | torch.device,
     batch_size: int,
     seed: int,
+    on_progress: Callable[[int], None] | None = None,
 ) -> tuple[float, float]:
     rng = random.Random(seed)
     pairs = [preference_example(task, rng, index) for index, task in enumerate(tasks)]
@@ -87,6 +132,8 @@ def heldout_preference_metrics(
             model, rejected[start : start + batch_size], tokenizer.pad_id, device
         )
         margins.append((chosen_logps - rejected_logps).cpu())
+        if on_progress is not None:
+            on_progress(min(start + batch_size, len(pairs)))
     if not margins:
         return 0.0, 0.0
     values = torch.cat(margins)
@@ -112,6 +159,7 @@ def evaluate_model(
     config: EvalConfig | None = None,
     reference: SmolLM | None = None,
     raw_output: str | Path | None = None,
+    on_progress: Callable[[int, int, str], None] | None = None,
 ) -> dict[str, object]:
     config = config or EvalConfig()
     model.eval()
@@ -119,7 +167,8 @@ def evaluate_model(
     episode_samples: list[TrainingSequence] = []
     records: list[dict[str, object]] = []
 
-    for task in tasks:
+    total_work = len(tasks) * 2
+    for index, task in enumerate(tasks):
         direct = sample_group(
             model,
             tokenizer,
@@ -151,10 +200,15 @@ def evaluate_model(
                 "episode_reward": episode.reward,
                 "episode_correct": bool(episode.breakdown and episode.breakdown.correct),
                 "episode_valid": bool(episode.breakdown and episode.breakdown.valid_format),
+                "episode_attempted_tool": bool(
+                    episode.breakdown and episode.breakdown.attempted_tool
+                ),
                 "episode_used_tool": bool(episode.breakdown and episode.breakdown.used_tool),
                 "episode_steps": episode.breakdown.steps if episode.breakdown else 0,
             }
         )
+        if on_progress is not None:
+            on_progress(index + 1, total_work, "generations")
 
     if reference is not None:
         reference.eval()
@@ -165,10 +219,18 @@ def evaluate_model(
     episode_correct = [bool(sample.breakdown and sample.breakdown.correct) for sample in episode_samples]
     episode_valid = [bool(sample.breakdown and sample.breakdown.valid_format) for sample in episode_samples]
     episode_tools = [bool(sample.breakdown and sample.breakdown.used_tool) for sample in episode_samples]
-    episode_tool_attempts = ["<tool>" in sample.response for sample in episode_samples]
+    episode_tool_attempts = [
+        bool(sample.breakdown and sample.breakdown.attempted_tool)
+        for sample in episode_samples
+    ]
     low, high = bootstrap_interval(
         episode_correct, samples=config.bootstrap_samples, seed=config.seed
     )
+    preference_progress = None
+    if on_progress is not None:
+        preference_progress = lambda completed: on_progress(
+            len(tasks) + completed, total_work, "preferences"
+        )
     preference_accuracy, preference_margin = heldout_preference_metrics(
         model,
         tokenizer,
@@ -176,6 +238,7 @@ def evaluate_model(
         device,
         config.preference_batch_size,
         config.seed,
+        on_progress=preference_progress,
     )
 
     by_difficulty: dict[str, dict[str, float]] = {}
@@ -184,6 +247,7 @@ def evaluate_model(
         by_difficulty[difficulty] = {
             "direct_accuracy": _rate([direct_correct[index] for index in selected]),
             "tool_accuracy": _rate([episode_correct[index] for index in selected]),
+            "tool_attempt_rate": _rate([episode_tool_attempts[index] for index in selected]),
             "tool_use_rate": _rate([episode_tools[index] for index in selected]),
         }
 
@@ -195,6 +259,8 @@ def evaluate_model(
         "tool_accuracy": _rate(episode_correct),
         "valid_format_rate": _rate(episode_valid),
         "direct_valid_format_rate": _rate(direct_valid),
+        "tool_attempt_rate": _rate(episode_tool_attempts),
+        "tool_use_rate": _rate(episode_tools),
         "valid_tool_call_rate": _rate(
             [
                 episode_tools[index]
@@ -218,6 +284,7 @@ def evaluate_model(
         "tool_accuracy_ci95": [low, high],
         "by_difficulty": by_difficulty,
     }
+    metrics["quality_index"] = quality_index_from_metrics(metrics)
 
     if raw_output is not None:
         output = Path(raw_output)

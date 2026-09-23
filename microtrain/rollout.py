@@ -283,6 +283,7 @@ def sample_episode(
         valid=valid,
         tool_calls=env.tool_calls,
         steps=steps,
+        tool_attempts=env.tool_attempts,
     )
     return TrainingSequence(
         prompt=task.prompt,

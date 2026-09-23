@@ -13,9 +13,13 @@ dependencies = [
   "huggingface-hub>=0.24",
   "safetensors>=0.4",
   "tokenizers>=0.19",
+  "rich>=13.9",
 ]
 
-[project.optional-dependencies]
+[project.scripts]
+microtrain = "microtrain.run:main"
+
+[dependency-groups]
 dev = ["pytest>=8", "transformers>=4.40"]
 
 [tool.setuptools.packages.find]
@@ -24,4 +28,3 @@ include = ["microtrain*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
-

@@ -147,6 +147,7 @@ class ArithmeticEnv:
         self.calculator = calculator or SafeCalculator()
         self.max_tool_calls = max_tool_calls
         self.tool_calls = 0
+        self.tool_attempts = 0
         self.done = False
 
     @property
@@ -161,15 +162,16 @@ class ArithmeticEnv:
             self.done = True
             return StepResult("", True, answer == self.task.answer, True)
 
+        if "<tool>" in action:
+            self.tool_attempts += 1
         expression = parse_tool_call(action)
         if expression is None or self.tool_calls >= self.max_tool_calls:
             self.done = True
             return StepResult("", True, False, False)
-        self.tool_calls += 1
         try:
             result = self.calculator.evaluate(expression)
         except CalculatorError:
             self.done = True
             return StepResult("", True, False, False)
+        self.tool_calls += 1
         return StepResult(tool_result(result), False, False, True)
-

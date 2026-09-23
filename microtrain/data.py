@@ -92,6 +92,34 @@ def sft_example(task: Task) -> dict[str, str]:
     return {"id": task.id, "prompt": task.prompt, "completion": completion}
 
 
+def stratified_task_view(tasks: list[Task], size: int) -> list[Task]:
+    """Select an interleaved, near-equal easy/medium/hard curriculum view."""
+
+    difficulties = ("easy", "medium", "hard")
+    base, remainder = divmod(size, len(difficulties))
+    quotas = {
+        difficulty: base + (index < remainder)
+        for index, difficulty in enumerate(difficulties)
+    }
+    buckets = {
+        difficulty: [task for task in tasks if task.difficulty == difficulty]
+        for difficulty in difficulties
+    }
+    for difficulty, quota in quotas.items():
+        if len(buckets[difficulty]) < quota:
+            raise RuntimeError(
+                f"could not fill {difficulty} curriculum: "
+                f"needed {quota}, found {len(buckets[difficulty])}"
+            )
+
+    selected: list[Task] = []
+    for offset in range(max(quotas.values(), default=0)):
+        for difficulty in difficulties:
+            if offset < quotas[difficulty]:
+                selected.append(buckets[difficulty][offset])
+    return selected
+
+
 def preference_example(task: Task, rng: random.Random, index: int) -> dict[str, str]:
     category = ("correctness", "format", "strategy")[index % 3]
     tool_preferred = prefers_tool(task)
@@ -143,7 +171,7 @@ def build_manifest(seed: int = 42, sizes: ManifestSizes | None = None) -> dict[s
     evaluation = generate_tasks(sizes.eval, seed + 1, held_out=True)
     preference_rng = random.Random(seed + 2)
     manifest: dict[str, object] = {
-        "version": 1,
+        "version": 2,
         "seed": seed,
         "sizes": asdict(sizes),
         "protocol": "xml-calculator-v1",
@@ -158,10 +186,8 @@ def build_manifest(seed: int = 42, sizes: ManifestSizes | None = None) -> dict[s
             if task.difficulty == "easy"
         ][: sizes.rlvr],
         "agent_rl": [
-            task.to_dict()
-            for task in train
-            if task.difficulty in {"easy", "medium"}
-        ][: sizes.agent_rl],
+            task.to_dict() for task in stratified_task_view(train, sizes.agent_rl)
+        ],
         "eval": [task.to_dict() for task in evaluation],
     }
     expected_sizes = {

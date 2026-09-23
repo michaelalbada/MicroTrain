@@ -6,9 +6,12 @@ import html
 import json
 from pathlib import Path
 
+from .eval import quality_index_from_metrics
+
 
 STAGE_ORDER = ["base", "sft", "dpo", "rlvr", "agent_rl"]
 SERIES = {
+    "Quality index": ("quality_index", "#0f172a"),
     "Direct accuracy": ("direct_accuracy", "#2563eb"),
     "Tool accuracy": ("tool_accuracy", "#16a34a"),
     "Valid format": ("valid_format_rate", "#9333ea"),
@@ -21,6 +24,7 @@ def read_evaluations(path: str | Path) -> list[dict[str, object]]:
     for line in Path(path).read_text().splitlines():
         record = json.loads(line)
         if record.get("kind") == "evaluation" and record.get("stage") in STAGE_ORDER:
+            record.setdefault("quality_index", quality_index_from_metrics(record))
             latest[str(record["stage"])] = record
     return [latest[stage] for stage in STAGE_ORDER if stage in latest]
 
@@ -64,7 +68,7 @@ def write_capability_svg(metrics_path: str | Path, output_path: str | Path) -> P
         parts.append(f'<polyline class="line" stroke="{color}" points="{joined}"/>')
         for x, y in points:
             parts.append(f'<circle class="dot" fill="{color}" cx="{x:.1f}" cy="{y:.1f}" r="5"/>')
-        legend_x = left + series_index * 190
+        legend_x = left + series_index * (plot_width / len(SERIES))
         parts.append(f'<line x1="{legend_x}" y1="{height-22}" x2="{legend_x+24}" y2="{height-22}" stroke="{color}" stroke-width="3"/>')
         parts.append(f'<text x="{legend_x+32}" y="{height-17}" font-size="12">{html.escape(label)}</text>')
 
@@ -73,4 +77,3 @@ def write_capability_svg(metrics_path: str | Path, output_path: str | Path) -> P
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_text("\n".join(parts) + "\n")
     return destination
-

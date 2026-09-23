@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import random
 from dataclasses import dataclass
-from typing import Sequence
+from pathlib import Path
+from typing import Callable, Sequence
 
 import torch
 
@@ -37,6 +39,106 @@ class GRPOConfig:
     grad_clip: float = 1.0
     seed: int = 42
     log_every: int = 1
+    tool_guard_steps: int = 5
+
+
+class NoValidToolCallsError(RuntimeError):
+    """Raised before Agent RL can persist a policy that never executes its tool."""
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.metrics: list[dict[str, float | int]] = []
+
+
+def balanced_prompt_sample(
+    tasks: Sequence[Task],
+    count: int,
+    rng: random.Random,
+) -> list[Task]:
+    """Sample a per-update batch with near-equal difficulty representation."""
+
+    difficulties = ("easy", "medium", "hard")
+    if count < len(difficulties):
+        raise ValueError("balanced prompt batches require at least three prompts")
+    buckets = {
+        difficulty: [task for task in tasks if task.difficulty == difficulty]
+        for difficulty in difficulties
+    }
+    missing = [difficulty for difficulty, bucket in buckets.items() if not bucket]
+    if missing:
+        raise ValueError(f"balanced prompt batch is missing difficulties: {missing}")
+
+    base, remainder = divmod(count, len(difficulties))
+    extra_order = list(difficulties)
+    rng.shuffle(extra_order)
+    quotas = {difficulty: base for difficulty in difficulties}
+    for difficulty in extra_order[:remainder]:
+        quotas[difficulty] += 1
+    selected = [
+        rng.choice(buckets[difficulty])
+        for difficulty in difficulties
+        for _ in range(quotas[difficulty])
+    ]
+    rng.shuffle(selected)
+    return selected
+
+
+def check_tool_call_guard(
+    *,
+    tools: bool,
+    step: int,
+    total_steps: int,
+    guard_steps: int,
+    valid_tool_calls: int,
+) -> None:
+    if (
+        tools
+        and guard_steps > 0
+        and total_steps >= guard_steps
+        and step == guard_steps
+        and valid_tool_calls == 0
+    ):
+        raise NoValidToolCallsError(
+            f"no valid calculator call was executed in the first {guard_steps} updates; "
+            "inspect the saved Agent-RL trajectories before retrying"
+        )
+
+
+def write_representative_trajectories(
+    path: Path,
+    *,
+    step: int,
+    tasks: Sequence[Task],
+    sequences: Sequence[TrainingSequence],
+    group_size: int,
+) -> None:
+    """Append the lowest/highest-reward trajectory for every prompt group."""
+
+    with path.open("a") as handle:
+        for prompt_index, task in enumerate(tasks):
+            start = prompt_index * group_size
+            group = sequences[start : start + group_size]
+            ranked = sorted(enumerate(group), key=lambda item: item[1].reward)
+            representatives = (("lowest", ranked[0]), ("highest", ranked[-1]))
+            for representative, (sample_index, sequence) in representatives:
+                breakdown = sequence.breakdown
+                record = {
+                    "kind": "training_trajectory",
+                    "step": step,
+                    "prompt_id": task.id,
+                    "difficulty": task.difficulty,
+                    "expression": task.expression,
+                    "representative": representative,
+                    "sample_index": sample_index,
+                    "response": sequence.response,
+                    "reward": sequence.reward,
+                    "correct": bool(breakdown and breakdown.correct),
+                    "valid_format": bool(breakdown and breakdown.valid_format),
+                    "attempted_tool": bool(breakdown and breakdown.attempted_tool),
+                    "executed_tool": bool(breakdown and breakdown.used_tool),
+                    "policy_tokens": sum(sequence.policy_mask),
+                }
+                handle.write(json.dumps(record, sort_keys=True) + "\n")
 
 
 def group_normalize(rewards: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
@@ -85,7 +187,7 @@ def grpo_loss(
 
     # Positive sampled KL estimator used by GRPO implementations.
     log_ratio = reference_logprobs - new_logprobs
-    sampled_kl = torch.exp(log_ratio) - log_ratio - 1.0
+    sampled_kl = (torch.exp(log_ratio) - log_ratio - 1.0).clamp_min(0.0)
     denominator = token_mask.sum().clamp_min(1)
     policy_mean = (policy_loss * token_mask).sum() / denominator
     kl_mean = (sampled_kl * token_mask).sum() / denominator
@@ -161,6 +263,9 @@ def train_grpo(
     device: str | torch.device,
     *,
     tools: bool = False,
+    balanced_difficulties: bool = False,
+    trajectory_output: str | Path | None = None,
+    on_log: Callable[[dict[str, float | int]], None] | None = None,
 ) -> list[dict[str, float | int]]:
     if not tasks:
         raise ValueError("GRPO requires at least one task")
@@ -174,12 +279,29 @@ def train_grpo(
         model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay
     )
     metrics: list[dict[str, float | int]] = []
+    valid_tool_calls = 0
+    trajectory_path = Path(trajectory_output) if trajectory_output is not None else None
+    if trajectory_path is not None:
+        trajectory_path.parent.mkdir(parents=True, exist_ok=True)
+        trajectory_path.write_text("")
 
     for step in range(1, config.steps + 1):
-        prompt_tasks = [tasks[rng.randrange(len(tasks))] for _ in range(config.prompts_per_step)]
+        prompt_tasks = (
+            balanced_prompt_sample(tasks, config.prompts_per_step, rng)
+            if balanced_difficulties
+            else [tasks[rng.randrange(len(tasks))] for _ in range(config.prompts_per_step)]
+        )
         sequences, advantages = collect_groups(
             model, reference, tokenizer, prompt_tasks, config, device, tools=tools
         )
+        if trajectory_path is not None:
+            write_representative_trajectories(
+                trajectory_path,
+                step=step,
+                tasks=prompt_tasks,
+                sequences=sequences,
+                group_size=config.group_size,
+            )
         reward_mean = sum(sequence.reward for sequence in sequences) / len(sequences)
         correct_rate = sum(
             bool(sequence.breakdown and sequence.breakdown.correct) for sequence in sequences
@@ -187,9 +309,19 @@ def train_grpo(
         valid_rate = sum(
             bool(sequence.breakdown and sequence.breakdown.valid_format) for sequence in sequences
         ) / len(sequences)
-        tool_use_rate = sum(
+        tool_attempts = sum(
+            bool(sequence.breakdown and sequence.breakdown.attempted_tool)
+            for sequence in sequences
+        )
+        executed_tool_calls = sum(
             bool(sequence.breakdown and sequence.breakdown.used_tool) for sequence in sequences
-        ) / len(sequences)
+        )
+        tool_attempt_rate = tool_attempts / len(sequences)
+        tool_use_rate = executed_tool_calls / len(sequences)
+        valid_tool_call_rate = (
+            executed_tool_calls / tool_attempts if tool_attempts else 0.0
+        )
+        valid_tool_calls += executed_tool_calls
         mean_length = sum(sum(sequence.policy_mask) for sequence in sequences) / len(sequences)
         entropy_values = [value for sequence in sequences for value in sequence.entropies]
         mean_entropy = sum(entropy_values) / len(entropy_values) if entropy_values else 0.0
@@ -202,43 +334,81 @@ def train_grpo(
             .mean()
         )
 
+        prompt_count = len(prompt_tasks)
         for _ in range(config.update_epochs):
-            inputs, targets, token_mask = collate_sequences(sequences, tokenizer.pad_id, device)
-            old_logprobs = _padded_values(sequences, "old_logprobs", token_mask, device)
-            reference_logprobs = _padded_values(
-                sequences, "reference_logprobs", token_mask, device
-            )
-            model.train()
-            new_logprobs = token_logprobs(model, inputs, targets, config.temperature)
             optimizer.zero_grad(set_to_none=True)
-            loss, diagnostics = grpo_loss(
-                new_logprobs,
-                old_logprobs,
-                reference_logprobs,
-                token_mask,
-                advantages,
-                clip_epsilon=config.clip_epsilon,
-                kl_beta=config.kl_beta,
-            )
-            loss.backward()
+            losses: list[torch.Tensor] = []
+            diagnostic_values: dict[str, list[torch.Tensor]] = {
+                "policy_loss": [],
+                "kl": [],
+                "clip_fraction": [],
+            }
+            for prompt_index in range(prompt_count):
+                start = prompt_index * config.group_size
+                stop = start + config.group_size
+                prompt_sequences = sequences[start:stop]
+                prompt_advantages = advantages[start:stop]
+                inputs, targets, token_mask = collate_sequences(
+                    prompt_sequences, tokenizer.pad_id, device
+                )
+                old_logprobs = _padded_values(
+                    prompt_sequences, "old_logprobs", token_mask, device
+                )
+                reference_logprobs = _padded_values(
+                    prompt_sequences, "reference_logprobs", token_mask, device
+                )
+                model.train()
+                new_logprobs = token_logprobs(model, inputs, targets, config.temperature)
+                prompt_loss, prompt_diagnostics = grpo_loss(
+                    new_logprobs,
+                    old_logprobs,
+                    reference_logprobs,
+                    token_mask,
+                    prompt_advantages,
+                    clip_epsilon=config.clip_epsilon,
+                    kl_beta=config.kl_beta,
+                )
+                (prompt_loss / prompt_count).backward()
+                losses.append(prompt_loss.detach())
+                for name, value in prompt_diagnostics.items():
+                    diagnostic_values[name].append(value)
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
             optimizer.step()
+            loss = torch.stack(losses).mean()
+            diagnostics = {
+                name: torch.stack(values).mean()
+                for name, values in diagnostic_values.items()
+            }
 
+        record = {
+            "step": step,
+            "loss": float(loss.detach()),
+            "reward": reward_mean,
+            "correct_rate": correct_rate,
+            "valid_rate": valid_rate,
+            "tool_attempt_rate": tool_attempt_rate,
+            "valid_tool_call_rate": valid_tool_call_rate,
+            "tool_use_rate": tool_use_rate,
+            "mean_length": mean_length,
+            "entropy": mean_entropy,
+            "kl": float(diagnostics["kl"]),
+            "clip_fraction": float(diagnostics["clip_fraction"]),
+            "zero_variance_groups": zero_variance,
+            "grad_norm": float(grad_norm),
+        }
+        metrics.append(record)
         if step == 1 or step % config.log_every == 0 or step == config.steps:
-            metrics.append(
-                {
-                    "step": step,
-                    "loss": float(loss.detach()),
-                    "reward": reward_mean,
-                    "correct_rate": correct_rate,
-                    "valid_rate": valid_rate,
-                    "tool_use_rate": tool_use_rate,
-                    "mean_length": mean_length,
-                    "entropy": mean_entropy,
-                    "kl": float(diagnostics["kl"]),
-                    "clip_fraction": float(diagnostics["clip_fraction"]),
-                    "zero_variance_groups": zero_variance,
-                    "grad_norm": float(grad_norm),
-                }
+            if on_log is not None:
+                on_log(record)
+        try:
+            check_tool_call_guard(
+                tools=tools,
+                step=step,
+                total_steps=config.steps,
+                guard_steps=config.tool_guard_steps,
+                valid_tool_calls=valid_tool_calls,
             )
+        except NoValidToolCallsError as error:
+            error.metrics = list(metrics)
+            raise
     return metrics

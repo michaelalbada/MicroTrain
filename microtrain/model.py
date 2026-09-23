@@ -2,7 +2,7 @@
 
 This file intentionally implements one architecture rather than a configurable
 model zoo. Parameter names mirror Hugging Face's Llama implementation so the
-public SmolLM2-135M safetensors checkpoint can be loaded without conversion.
+public SmolLM2-135M and SmolLM2-360M checkpoints load without conversion.
 """
 
 from __future__ import annotations
@@ -252,4 +252,3 @@ class SmolLM(nn.Module):
         logits, new_cache = self._forward(input_ids, position_ids, cache, use_cache=True)
         assert new_cache is not None
         return logits, new_cache
-
